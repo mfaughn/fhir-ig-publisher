@@ -38,4 +38,6 @@ public class PublisherSettings {
     @Getter private final List<String> noNarratives = new ArrayList<String>();
     @Getter private final List<String> noValidate = new ArrayList<String>();
     @Getter @Setter String jekyllCommand = "jekyll";
+    @Getter @Setter private boolean parallelGeneration = false;
+    @Getter @Setter private int parallelThreadCount = 0; // 0 = auto (available processors)
 }

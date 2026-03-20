@@ -1487,6 +1487,22 @@ public class Publisher extends PublisherBase implements IReferenceResolver, IVal
         System.out.println("Running without generation to shorten the run time (editor process only)");
       }
 
+      if (CliParams.hasNamedParam(args, CliParams.PARALLEL)) {
+        self.settings.setParallelGeneration(true);
+        String threads = CliParams.getNamedParam(args, CliParams.PARALLEL);
+        if (threads != null) {
+          try {
+            self.settings.setParallelThreadCount(Integer.parseInt(threads));
+          } catch (NumberFormatException e) {
+            // -parallel was used as a bare flag, not -parallel N
+          }
+        }
+        int threadCount = self.settings.getParallelThreadCount() > 0
+            ? self.settings.getParallelThreadCount()
+            : Runtime.getRuntime().availableProcessors();
+        System.out.println("Running with parallel generation using " + threadCount + " threads");
+      }
+
       // deprecated
       if (CliParams.hasNamedParam(args, "-new-template-format")) {
         self.settings.setNewMultiLangTemplateFormat(true);

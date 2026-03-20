@@ -101,7 +101,7 @@ public class PublisherBase implements ILoggingService {
   }
 
   @Override
-  public void logMessage(String msg) {
+  public synchronized void logMessage(String msg) {
 //    String s = lastMsg;
 //    lastMsg = msg;
 //    if (s == null) {

@@ -4,6 +4,7 @@ public class CliParams {
 
 	public static final String DEBUG_LOG = "-debug-log";
 	public static final String TRACE_LOG = "-trace-log";
+	public static final String PARALLEL = "-parallel";
 
 	public static String getNamedParam(String[] args, String param) {
 	  boolean found = false;

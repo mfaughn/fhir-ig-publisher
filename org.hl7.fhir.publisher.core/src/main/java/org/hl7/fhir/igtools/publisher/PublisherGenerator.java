@@ -97,6 +97,10 @@ import java.nio.file.Paths;
 import java.sql.SQLException;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -295,22 +299,30 @@ public class PublisherGenerator extends PublisherBase {
     }
 
     logMessage("Generate HTML Outputs");
-    for (FetchedFile f : pf.changeList) {
-      f.start("generate2");
-      try {
-        generateHtmlOutputs(f, false, db, null);
-      } finally {
-        f.finish("generate2");
+    if (settings.isParallelGeneration()) {
+      generateHtmlOutputsParallel(db);
+    } else {
+      for (FetchedFile f : pf.changeList) {
+        f.start("generate2");
+        try {
+          generateHtmlOutputs(f, false, db, null);
+        } finally {
+          f.finish("generate2");
+        }
       }
     }
 
     logMessage("Generate Spreadsheets");
-    for (FetchedFile f : pf.changeList) {
-      f.start("generate2");
-      try {
-        generateSpreadsheets(f, false, db);
-      } finally {
-        f.finish("generate2");
+    if (settings.isParallelGeneration()) {
+      generateSpreadsheetsParallel(db);
+    } else {
+      for (FetchedFile f : pf.changeList) {
+        f.start("generate2");
+        try {
+          generateSpreadsheets(f, false, db);
+        } finally {
+          f.finish("generate2");
+        }
       }
     }
     if (pf.allProfilesCsv != null) {
@@ -686,6 +698,74 @@ public class PublisherGenerator extends PublisherBase {
       var json = saveNativeResourceOutputs(f, r);
       if (db != null) {
         db.saveResource(f, r, json);
+      }
+    }
+  }
+
+  private void generateHtmlOutputsParallel(DBBuilder db) throws Exception {
+    int threadCount = settings.getParallelThreadCount() > 0
+        ? settings.getParallelThreadCount()
+        : Runtime.getRuntime().availableProcessors();
+    ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+    List<Future<?>> futures = new ArrayList<>();
+
+    for (FetchedFile f : pf.changeList) {
+      futures.add(executor.submit(() -> {
+        f.start("generate2");
+        try {
+          generateHtmlOutputs(f, false, db, null);
+        } catch (Exception e) {
+          throw new RuntimeException("Error generating HTML for " + f.getName(), e);
+        } finally {
+          f.finish("generate2");
+        }
+        return null;
+      }));
+    }
+
+    executor.shutdown();
+    for (Future<?> future : futures) {
+      try {
+        future.get();
+      } catch (ExecutionException e) {
+        if (e.getCause() instanceof Exception) {
+          throw (Exception) e.getCause();
+        }
+        throw new Exception("Parallel HTML generation failed: " + e.getCause().getMessage(), e.getCause());
+      }
+    }
+  }
+
+  private void generateSpreadsheetsParallel(DBBuilder db) throws Exception {
+    int threadCount = settings.getParallelThreadCount() > 0
+        ? settings.getParallelThreadCount()
+        : Runtime.getRuntime().availableProcessors();
+    ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+    List<Future<?>> futures = new ArrayList<>();
+
+    for (FetchedFile f : pf.changeList) {
+      futures.add(executor.submit(() -> {
+        f.start("generate2");
+        try {
+          generateSpreadsheets(f, false, db);
+        } catch (Exception e) {
+          throw new RuntimeException("Error generating spreadsheets for " + f.getName(), e);
+        } finally {
+          f.finish("generate2");
+        }
+        return null;
+      }));
+    }
+
+    executor.shutdown();
+    for (Future<?> future : futures) {
+      try {
+        future.get();
+      } catch (ExecutionException e) {
+        if (e.getCause() instanceof Exception) {
+          throw (Exception) e.getCause();
+        }
+        throw new Exception("Parallel spreadsheet generation failed: " + e.getCause().getMessage(), e.getCause());
       }
     }
   }
