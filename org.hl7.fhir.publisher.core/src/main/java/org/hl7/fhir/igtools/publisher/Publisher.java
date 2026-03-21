@@ -404,6 +404,33 @@ public class Publisher extends PublisherBase implements IReferenceResolver, IVal
       processor.loadConformance2();
       processor.checkSignBundles();
 
+      // Parallel-split coordinator mode: spawn workers and skip to merge phase
+      if (settings.getParallelSplitCount() > 0 && settings.getParallelSplitWorkerIndex() < 0) {
+        runParallelSplitCoordinator(buildTracker, tts);
+        return;
+      }
+
+      // Parallel-split worker mode: filter changeList and only do validation
+      if (settings.getParallelSplitWorkerIndex() >= 0) {
+        filterChangeListForWorker();
+
+        if (!settings.isValidationOff()) {
+          log("Validating Resources");
+          try {
+            processor.validate();
+          } catch (Exception ex) {
+            log("Unhandled Exception: " + ex.toString());
+            throw (ex);
+          }
+          pf.validatorSession.close();
+        }
+
+        writeWorkerResults();
+        log("Worker " + settings.getParallelSplitWorkerIndex() + " complete");
+        tts.end();
+        return;
+      }
+
       if (!settings.isValidationOff()) {
         log("Validating Resources");
         try {
@@ -467,6 +494,278 @@ public class Publisher extends PublisherBase implements IReferenceResolver, IVal
       }
       throw e;
     }
+  }
+
+  /**
+   * Worker mode: filter changeList to only files assigned to this worker.
+   * Assignment is round-robin by file index: worker K processes files where index % N == K.
+   */
+  private void filterChangeListForWorker() {
+    int workerIndex = settings.getParallelSplitWorkerIndex();
+    int totalWorkers = settings.getParallelSplitCount();
+    int totalFiles = pf.changeList.size();
+    List<FetchedFile> myFiles = new ArrayList<>();
+    for (int i = 0; i < pf.changeList.size(); i++) {
+      if (i % totalWorkers == workerIndex) {
+        myFiles.add(pf.changeList.get(i));
+      }
+    }
+    log("Worker " + workerIndex + "/" + totalWorkers + ": processing " + myFiles.size() + " of " + totalFiles + " files");
+    pf.changeList.clear();
+    pf.changeList.addAll(myFiles);
+  }
+
+  /**
+   * Worker mode: serialize validation errors for each processed file to a JSON file
+   * that the coordinator can read and merge.
+   */
+  private void writeWorkerResults() throws Exception {
+    int workerIndex = settings.getParallelSplitWorkerIndex();
+    JsonObject results = new JsonObject();
+    results.add("workerIndex", workerIndex);
+    JsonArray filesArray = new JsonArray();
+    for (FetchedFile f : pf.changeList) {
+      JsonObject fileObj = new JsonObject();
+      fileObj.add("path", f.getPath());
+      JsonArray errorsArray = new JsonArray();
+      for (ValidationMessage vm : f.getErrors()) {
+        JsonObject errObj = new JsonObject();
+        if (vm.getLevel() != null) errObj.add("level", vm.getLevel().toCode());
+        if (vm.getType() != null) errObj.add("type", vm.getType().toCode());
+        if (vm.getLocation() != null) errObj.add("location", vm.getLocation());
+        if (vm.getMessage() != null) errObj.add("message", vm.getMessage());
+        if (vm.getSource() != null) errObj.add("source", vm.getSource().name());
+        if (vm.getLine() >= 0) errObj.add("line", vm.getLine());
+        if (vm.getCol() >= 0) errObj.add("col", vm.getCol());
+        if (vm.getHtml() != null) errObj.add("html", vm.getHtml());
+        if (vm.getMessageId() != null) errObj.add("messageId", vm.getMessageId());
+        errorsArray.add(errObj);
+      }
+      fileObj.add("errors", errorsArray);
+      filesArray.add(fileObj);
+    }
+    results.add("files", filesArray);
+    String json = org.hl7.fhir.utilities.json.parser.JsonParser.compose(results, true);
+    String resultPath = Utilities.path(pf.rootDir, "worker-" + workerIndex + "-results.json");
+    FileUtilities.stringToFile(json, resultPath);
+    log("Worker " + workerIndex + ": wrote results to " + resultPath);
+  }
+
+  /**
+   * Coordinator mode: spawn N worker processes, wait for completion, merge results,
+   * then continue with the remaining pipeline phases.
+   */
+  private void runParallelSplitCoordinator(IniFile buildTracker, TimeTracker.Session tts) throws Exception {
+    int workerCount = settings.getParallelSplitCount();
+    log("Parallel-split coordinator: launching " + workerCount + " worker processes");
+
+    // Store the total file count and split info before workers need it
+    settings.setParallelSplitCount(workerCount);
+
+    // Detect the JAR path we're running from
+    String jarPath = detectJarPath();
+    String javaPath = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java";
+    String igPath = settings.getConfigFile();
+
+    // Build the base args list, filtering out coordinator-specific flags
+    List<String> baseArgs = buildWorkerArgs();
+
+    // Launch worker processes
+    List<Process> workers = new ArrayList<>();
+    for (int k = 0; k < workerCount; k++) {
+      List<String> cmd = new ArrayList<>();
+      cmd.add(javaPath);
+      cmd.add("-Xmx4g");
+      cmd.add("-jar");
+      cmd.add(jarPath);
+      cmd.addAll(baseArgs);
+      cmd.add(CliParams.PARALLEL_SPLIT_WORKER);
+      cmd.add(String.valueOf(k));
+      // Pass the total worker count so workers can compute their assignment
+      cmd.add(CliParams.PARALLEL_SPLIT);
+      cmd.add(String.valueOf(workerCount));
+
+      log("  Launching worker " + k + ": " + String.join(" ", cmd));
+      ProcessBuilder pb = new ProcessBuilder(cmd);
+      pb.inheritIO();
+      pb.directory(new File(System.getProperty("user.dir")));
+      workers.add(pb.start());
+      // Small stagger between first and second worker to avoid template XSLT race
+      if (k == 0 && workerCount > 1) {
+        Thread.sleep(3000);
+      }
+    }
+
+    // Wait for all workers to complete
+    log("Waiting for " + workerCount + " workers to complete...");
+    for (int k = 0; k < workers.size(); k++) {
+      int exitCode = workers.get(k).waitFor();
+      if (exitCode != 0) {
+        // Kill remaining workers
+        for (int j = k + 1; j < workers.size(); j++) {
+          workers.get(j).destroyForcibly();
+        }
+        throw new Exception("Worker " + k + " failed with exit code " + exitCode);
+      }
+      log("  Worker " + k + " completed successfully");
+    }
+
+    // Merge validation results from all workers
+    log("Merging results from " + workerCount + " workers");
+    mergeWorkerResults(workerCount);
+
+    // Now continue with the rest of the pipeline
+    // Workers only did validation; coordinator does all generation (with -parallel for threading)
+    if (pf.needsRegen) {
+      log("Regenerating Narratives");
+      processor.generateNarratives(true);
+    }
+    log("Processing Provenance Records");
+    processor.processProvenanceDetails();
+    if (pf.hasTranslations) {
+      log("Generating Translation artifacts");
+      processor.processTranslationOutputs();
+    }
+    log("Generating Outputs in " + pf.outputDir);
+    Map<String, String> uncsList = scanForUnattributedCodeSystems();
+    generator.generate();
+    clean();
+    pf.dependentIgFinder.finish(pf.outputDir, pf.sourceIg.present());
+    List<FetchedResource> fragments = new ArrayList<>();
+    listFragments(fragments);
+    checkForSnomedVersion();
+    if (pf.txLog != null) {
+      if (ManagedFileAccess.file(pf.txLog).exists()) {
+        FileUtilities.copyFile(pf.txLog, Utilities.path(pf.rootDir, "output", "qa-tx.html"));
+      }
+    }
+    deleteDuplicateMessages();
+    ValidationPresenter val = new ValidationPresenter(pf.version, workingVersion(), pf.igpkp, pf.childPublisher == null? null : pf.childPublisher.getIgpkp(), pf.rootDir, pf.npmName, pf.childPublisher == null? null : pf.childPublisher.pf.npmName,
+        IGVersionUtil.getVersion(), fetchCurrentIGPubVersion(), pf.realmRules, pf.previousVersionComparator, pf.ipaComparator, pf.ipsComparator,
+        new DependencyRenderer(pf.pcm, pf.outputDir, pf.npmName, pf.templateManager, pf.dependencyList, pf.context, pf.markdownEngine, pf.rc, pf.specMaps).render(pf.publishedIg, true, false, false), new HTAAnalysisRenderer(pf.context, pf.outputDir, pf.markdownEngine).render(pf.packageId(), pf.fileList, pf.publishedIg.present()),
+        new PublicationChecker(pf.repoRoot, pf.historyPage, pf.markdownEngine, findReleaseLabelString(), pf.publishedIg, pf.relatedIGs).check(), renderGlobals(), pf.copyrightYear, pf.context, scanForR5Extensions(), pf.modifierExtensions,
+        generateDraftDependencies(), pf.noNarrativeResources, pf.noValidateResources, settings.isValidationOff(), settings.isGenerationOff(), pf.dependentIgFinder, pf.context.getTxClientManager(),
+        fragments, makeLangInfo(), pf.relatedIGs);
+    val.setValidationFlags(pf.hintAboutNonMustSupport, pf.anyExtensionsAllowed, pf.checkAggregation, pf.autoLoad, pf.showReferenceMessages, pf.noExperimentalContent, pf.displayWarnings);
+    FileUtilities.stringToFile(new IPViewRenderer(uncsList, pf.inspector.getExternalReferences(), pf.inspector.getImageRefs(), pf.inspector.getCopyrights(),
+            pf.ipStmt, pf.inspector.getVisibleFragments().get("1"), pf.context).execute(), Utilities.path(pf.outputDir, "qa-ipreview.html"));
+    tts.end();
+    if (isChild()) {
+      log("Built. " + pf.tt.report());
+    } else {
+      log("Built. " + pf.tt.report());
+      log("Generating QA");
+      log("Validation output in " + val.generate(pf.sourceIg.getName(), pf.errors, pf.fileList, Utilities.path(settings.getDestDir() != null ? settings.getDestDir() : pf.outputDir, "qa.html"), pf.suppressedMessages, pinSummary()));
+    }
+    recordOutcome(null, val);
+    buildTracker.setBooleanProperty("status", "complete", true, null);
+    buildTracker.save();
+    log("Finished @ " + nowString() + ". Max Memory Used = " + Utilities.describeSize(pf.maxMemory) + logSummary());
+  }
+
+  /**
+   * Detect the path to the JAR file we're running from, for launching worker processes.
+   */
+  private String detectJarPath() throws Exception {
+    try {
+      String path = Publisher.class.getProtectionDomain().getCodeSource().getLocation().toURI().getPath();
+      if (path.endsWith(".jar")) {
+        return path;
+      }
+      // Running from IDE/classes directory — look for the CLI JAR
+      throw new Exception("Cannot detect JAR path (running from classes directory). " +
+          "The -parallel-split feature requires running from the publisher JAR file.");
+    } catch (Exception e) {
+      throw new Exception("Cannot detect JAR path for launching worker processes: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * Build the argument list for worker processes by filtering the original args.
+   * Removes coordinator-specific flags and adds worker-specific ones.
+   */
+  private List<String> buildWorkerArgs() {
+    List<String> args = new ArrayList<>();
+    // Essential flags that workers need
+    args.add("-ig");
+    args.add(settings.getConfigFile());
+    if (settings.isNoSushi()) {
+      args.add("-no-sushi");
+    }
+    if (settings.getTxServer() != null) {
+      args.add("-tx");
+      args.add(settings.getTxServer());
+    }
+    if (settings.isValidationOff()) {
+      args.add("-validation-off");
+    }
+    if (settings.isGenerationOff()) {
+      args.add("-generation-off");
+    }
+    if (settings.isParallelGeneration()) {
+      args.add(CliParams.PARALLEL);
+      if (settings.getParallelThreadCount() > 0) {
+        args.add(String.valueOf(settings.getParallelThreadCount()));
+      }
+    }
+    if (settings.getPackageCacheFolder() != null) {
+      args.add("-package-cache-folder");
+      args.add(settings.getPackageCacheFolder());
+    }
+    if (settings.isDebug()) {
+      args.add("-debug");
+    }
+    return args;
+  }
+
+  /**
+   * Merge validation results from all worker result files into the coordinator's fileList.
+   */
+  private void mergeWorkerResults(int workerCount) throws Exception {
+    // Build a lookup map from file path to FetchedFile
+    Map<String, FetchedFile> filesByPath = new HashMap<>();
+    for (FetchedFile f : pf.fileList) {
+      filesByPath.put(f.getPath(), f);
+    }
+
+    int totalErrors = 0;
+    for (int k = 0; k < workerCount; k++) {
+      String resultPath = Utilities.path(pf.rootDir, "worker-" + k + "-results.json");
+      File resultFile = new File(resultPath);
+      if (!resultFile.exists()) {
+        throw new Exception("Worker " + k + " result file not found: " + resultPath);
+      }
+      String json = FileUtilities.fileToString(resultPath);
+      JsonObject results = org.hl7.fhir.utilities.json.parser.JsonParser.parseObject(json);
+      JsonArray files = results.getJsonArray("files");
+      for (int i = 0; i < files.size(); i++) {
+        JsonObject fileObj = (JsonObject) files.get(i);
+        String path = fileObj.asString("path");
+        FetchedFile ff = filesByPath.get(path);
+        if (ff != null) {
+          JsonArray errors = fileObj.getJsonArray("errors");
+          for (int j = 0; j < errors.size(); j++) {
+            JsonObject errObj = (JsonObject) errors.get(j);
+            ValidationMessage vm = new ValidationMessage(
+                errObj.has("source") ? Source.valueOf(errObj.asString("source")) : Source.Publisher,
+                errObj.has("type") ? IssueType.fromCode(errObj.asString("type")) : IssueType.INFORMATIONAL,
+                errObj.has("line") ? errObj.asInteger("line") : -1,
+                errObj.has("col") ? errObj.asInteger("col") : -1,
+                errObj.has("location") ? errObj.asString("location") : null,
+                errObj.has("message") ? errObj.asString("message") : "",
+                errObj.has("level") ? IssueSeverity.fromCode(errObj.asString("level")) : IssueSeverity.INFORMATION
+            );
+            if (errObj.has("html")) vm.setHtml(errObj.asString("html"));
+            if (errObj.has("messageId")) vm.setMessageId(errObj.asString("messageId"));
+            ff.getErrors().add(vm);
+            totalErrors++;
+          }
+        }
+      }
+      // Clean up result file
+      resultFile.delete();
+    }
+    log("  Merged " + totalErrors + " validation messages from " + workerCount + " workers");
   }
 
   private void listFragments(List<FetchedResource> fragments) {
@@ -1501,6 +1800,28 @@ public class Publisher extends PublisherBase implements IReferenceResolver, IVal
             ? self.settings.getParallelThreadCount()
             : Runtime.getRuntime().availableProcessors();
         System.out.println("Running with parallel generation using " + threadCount + " threads");
+      }
+
+      if (CliParams.hasNamedParam(args, CliParams.PARALLEL_SPLIT)) {
+        String count = CliParams.getNamedParam(args, CliParams.PARALLEL_SPLIT);
+        if (count != null) {
+          try {
+            self.settings.setParallelSplitCount(Integer.parseInt(count));
+            System.out.println("Running with parallel-split: " + count + " worker processes");
+          } catch (NumberFormatException e) {
+            throw new Exception("-parallel-split requires a numeric argument (number of workers)");
+          }
+        } else {
+          throw new Exception("-parallel-split requires a numeric argument (number of workers)");
+        }
+      }
+      if (CliParams.hasNamedParam(args, CliParams.PARALLEL_SPLIT_WORKER)) {
+        String k = CliParams.getNamedParam(args, CliParams.PARALLEL_SPLIT_WORKER);
+        if (k != null) {
+          self.settings.setParallelSplitWorkerIndex(Integer.parseInt(k));
+          // The split count is passed as the next arg after the worker index
+          // We read it from the manifest file instead
+        }
       }
 
       // deprecated

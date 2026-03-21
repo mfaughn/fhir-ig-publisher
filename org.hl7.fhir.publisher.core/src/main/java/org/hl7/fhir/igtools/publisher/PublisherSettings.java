@@ -40,4 +40,6 @@ public class PublisherSettings {
     @Getter @Setter String jekyllCommand = "jekyll";
     @Getter @Setter private boolean parallelGeneration = false;
     @Getter @Setter private int parallelThreadCount = 0; // 0 = auto (available processors)
+    @Getter @Setter private int parallelSplitCount = 0;      // 0 = disabled; N = run N worker processes
+    @Getter @Setter private int parallelSplitWorkerIndex = -1; // -1 = coordinator; 0..N-1 = worker index
 }

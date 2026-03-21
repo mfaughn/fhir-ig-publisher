@@ -56,17 +56,22 @@ public class TemplateManager {
   List<String> templateList = new ArrayList<>();
   Set<String> antScripts = new HashSet<>();
   private boolean autoMode;
+  private boolean reuseExistingTemplate = false;
 
   public TemplateManager(FilesystemPackageCacheManager pcm, ILoggingService logger) {
     this.pcm = pcm;
     this.logger = logger;
   }
 
+  public void setReuseExistingTemplate(boolean reuseExistingTemplate) {
+    this.reuseExistingTemplate = reuseExistingTemplate;
+  }
+
   public Template loadTemplate(String template, String rootFolder, String packageId, boolean autoMode, boolean wantLog, boolean rapidoMode) throws FHIRException, IOException {
     this.autoMode = autoMode;
     String templateDir = Utilities.path(rootFolder, "template");
     boolean inPlace = template.equals("#template");
-    if (!inPlace) {
+    if (!inPlace && !reuseExistingTemplate) {
       FileUtilities.createDirectory(templateDir);
       FileUtilities.clearDirectory(templateDir);
     };

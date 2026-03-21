@@ -109,6 +109,9 @@ public class PublisherIGLoader extends PublisherBase {
     log("API keys loaded from "+ FhirSettings.getFilePath());
 
     pf.templateManager = new TemplateManager(pf.pcm, pf.logger);
+    if (settings.getParallelSplitWorkerIndex() >= 0) {
+      pf.templateManager.setReuseExistingTemplate(true);
+    }
     pf.templateProvider = new IGPublisherLiquidTemplateServices();
     pf.extensionTracker = new ExtensionTracker();
     log("Package Cache: "+ pf.pcm.getFolder());
